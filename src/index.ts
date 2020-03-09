@@ -1,70 +1,196 @@
-import * as Debug from 'debug';
-import * as path from 'path';
+import { pathWritable } from '@ionic/utils-fs';
+import Debug from 'debug';
+import et from 'elementtree';
+import path from 'path';
 
-import { read as readConfig, run as runConfig, write as writeConfig } from './config';
-import { GeneratedImage, PLATFORMS, Platform, RunPlatformOptions, run as runPlatform, validatePlatforms } from './platform';
-import { RESOURCE_TYPES, ResourceType, validateResourceTypes } from './resources';
-import { getOptionValue } from './utils/cli';
+import { generateRunOptions, getDirectory, resolveOptions } from './cli';
+import { getConfigPath, read as readConfig, run as runConfig, write as writeConfig } from './config';
+import { BaseError } from './error';
+import { GeneratedResource, PLATFORMS, Platform, RunPlatformOptions, run as runPlatform } from './platform';
+import { DEFAULT_RESOURCES_DIRECTORY, Density, Orientation, ResolvedSource, SourceType } from './resources';
+import { tryFn } from './utils/fn';
 
 const debug = Debug('cordova-res');
 
-export async function run(): Promise<void> {
-  const args = process.argv.slice(2);
-
-  if (args.includes('--version')) {
-    const pkg = await import(path.resolve(__dirname, '../package.json'));
-    process.stdout.write(pkg.version + '\n');
-    return;
-  }
-
-  if (args[0] === 'help' || args.includes('--help') || args.includes('-h')) {
-    const help = await import('./help');
-    return help.run();
-  }
-
-  const configPath = 'config.xml';
-  const platformArg = args[0] ? args[0].toString() : undefined;
-  const typeOption = getOptionValue(args, '--type');
-
-  try {
-    const platforms = validatePlatforms(platformArg && !platformArg.startsWith('-') ? [platformArg] : PLATFORMS);
-    const types = validateResourceTypes(typeOption ? [typeOption] : RESOURCE_TYPES);
-    const config = await readConfig(configPath);
-    const images: GeneratedImage[] = [];
-
-    for (const platform of platforms) {
-      const platformImages = await runPlatform(platform, types, generateRunOptions(platform, args));
-      process.stdout.write(`Generated ${platformImages.length} images for ${platform}\n`);
-      images.push(...platformImages);
-    }
-
-    runConfig(images, config);
-    await writeConfig(configPath, config);
-    process.stdout.write(`Wrote to config.xml\n`);
-  } catch (e) {
-    debug('Caught fatal error: %O', e);
-    process.exitCode = 1;
-    process.stdout.write(e.stack ? e.stack : e.toString());
-  }
+interface Result {
+  resources: ResultResource[];
+  sources: ResultSource[];
 }
 
-export function generateRunOptions(platform: Platform, args: ReadonlyArray<string>): RunPlatformOptions {
-  const iconSourceOption = getOptionValue(args, '--icon-source');
-  const splashSourceOption = getOptionValue(args, '--splash-source');
+interface ResultResource {
+  src?: string;
+  dest?: string;
+  platform?: Platform;
+  width?: number;
+  height?: number;
+  density?: Density;
+  orientation?: Orientation;
+  target?: string;
+}
 
-  const iconOptions: Partial<RunPlatformOptions[ResourceType.ICON]> = {};
-  const splashOptions: Partial<RunPlatformOptions[ResourceType.SPLASH]> = {};
+interface ResultSource {
+  type: SourceType;
+  value: string;
+}
 
-  if (iconSourceOption) {
-    iconOptions.sources = [iconSourceOption];
+async function CordovaRes({
+  directory = getDirectory(),
+  resourcesDirectory = DEFAULT_RESOURCES_DIRECTORY,
+  logstream = process.stdout,
+  errstream = process.stderr,
+  platforms = {
+    [Platform.ANDROID]: generateRunOptions(Platform.ANDROID, resourcesDirectory, []),
+    [Platform.IOS]: generateRunOptions(Platform.IOS, resourcesDirectory, []),
+    [Platform.WINDOWS]: generateRunOptions(Platform.WINDOWS, resourcesDirectory, []),
+  },
+}: CordovaRes.Options = {}): Promise<Result> {
+  const configPath = getConfigPath(directory);
+
+  debug('Paths: (config: %O) (resources dir: %O)', configPath, resourcesDirectory);
+
+  let config: et.ElementTree | undefined;
+  const resources: GeneratedResource[] = [];
+  const sources: ResolvedSource[] = [];
+
+  if (await pathWritable(configPath)) {
+    config = await readConfig(configPath);
+  } else {
+    debug('File missing/not writable: %O', configPath);
+
+    if (errstream) {
+      errstream.write(`WARN: No config.xml file in directory. Skipping config.\n`);
+    }
   }
 
-  if (splashSourceOption) {
-    splashOptions.sources = [splashSourceOption];
+  for (const platform of PLATFORMS) {
+    const platformOptions = platforms[platform];
+
+    if (platformOptions) {
+      const platformResult = await runPlatform(platform, resourcesDirectory, platformOptions, errstream);
+      logstream.write(`Generated ${platformResult.resources.length} resources for ${platform}\n`);
+      resources.push(...platformResult.resources);
+      sources.push(...platformResult.sources);
+    }
+  }
+
+  if (config) {
+    await runConfig(configPath, resourcesDirectory, config, sources, resources, errstream);
+    await writeConfig(configPath, config);
+
+    logstream.write(`Wrote to config.xml\n`);
   }
 
   return {
-    [ResourceType.ICON]: { ...{ sources: [`resources/${platform}/icon.png`, 'resources/icon.png'] }, ...iconOptions },
-    [ResourceType.SPLASH]: { ...{ sources: [`resources/${platform}/splash.png`, 'resources/splash.png'] }, ...splashOptions },
+    resources: resources.map(resource => {
+      const { platform, type, src, foreground, background, width, height, density, orientation } = resource;
+
+      return {
+        platform,
+        type,
+        src,
+        foreground,
+        background,
+        width,
+        height,
+        density,
+        orientation,
+      };
+    }),
+    sources: sources.map(source => {
+      switch (source.type) {
+        case SourceType.RASTER:
+          return { platform: source.platform, resource: source.resource, type: SourceType.RASTER, value: source.src };
+        case SourceType.COLOR:
+          return { platform: source.platform, resource: source.resource, type: SourceType.COLOR, value: source.color, name: source.name };
+      }
+    }),
   };
 }
+
+namespace CordovaRes {
+  export type PlatformOptions = { [P in Platform]?: Readonly<RunPlatformOptions>; };
+
+  export const run = CordovaRes;
+
+  /**
+   * Options for `cordova-res`.
+   *
+   * Each key may be excluded to use a provided default.
+   */
+  export interface Options {
+    /**
+     * Operating directory. Usually the root of the project.
+     *
+     * `cordova-res` operates in the root of a standard Cordova project setup.
+     * The specified directory should contain `config.xml` and a resources
+     * folder, configured via `resourcesDirectory`.
+     */
+    readonly directory?: string;
+
+    /**
+     * Directory name or absolute path to resources directory.
+     *
+     * The resources directory contains the source images and generated images
+     * of a Cordova project's resources.
+     */
+    readonly resourcesDirectory?: string;
+
+    /**
+     * Specify an alternative output mechanism.
+     *
+     * A NullStream may be used to silence output entirely.
+     */
+    readonly logstream?: NodeJS.WritableStream;
+
+    /**
+     * Specify an alternative error output mechanism.
+     *
+     * A NullStream may be used to silence error output entirely.
+     */
+    readonly errstream?: NodeJS.WritableStream;
+
+    /**
+     * Resource generation configuration by platform.
+     *
+     * Each key/value represents the options for a supported platform. If
+     * provided, resources are generated in an explicit, opt-in manner.
+     */
+    readonly platforms?: Readonly<PlatformOptions>;
+  }
+
+  export async function runCommandLine(args: readonly string[]): Promise<void> {
+    if (args.includes('--version')) {
+      const pkg = await import(path.resolve(__dirname, '../package.json'));
+      process.stdout.write(pkg.version + '\n');
+      return;
+    }
+
+    if (args[0] === 'help' || args.includes('--help') || args.includes('-h')) {
+      const help = await import('./help');
+      return help.run();
+    }
+
+    try {
+      const directory = getDirectory();
+      const configPath = getConfigPath(directory);
+      const config = await tryFn(() => readConfig(configPath));
+      const options = await resolveOptions(args, directory, config);
+      const result = await run(options);
+
+      if (args.includes('--json')) {
+        process.stdout.write(JSON.stringify(result, undefined, '\t'));
+      }
+    } catch (e) {
+      debug('Caught fatal error: %O', e);
+      process.exitCode = 1;
+
+      if (args.includes('--json')) {
+        process.stdout.write(JSON.stringify({ error: e instanceof BaseError ? e : e.toString() }, undefined, '\t'));
+      } else {
+        process.stderr.write(`${e instanceof BaseError ? `ERROR: ${e.toString()}` : (e.stack ? e.stack : String(e))}\n`);
+      }
+    }
+  }
+}
+
+export = CordovaRes;

@@ -1,5 +1,7 @@
+import * as path from 'path';
+
 import { Platform } from '../platform';
-import { RESOURCES, ResourceType } from '../resources';
+import { ResourceType, getResourcesConfig } from '../resources';
 
 describe('cordova-res', () => {
 
@@ -30,29 +32,65 @@ describe('cordova-res', () => {
       });
 
       it('should run through android icons with successful result', async () => {
-        imageMock.resolveSourceImage.mockImplementation(async () => ['test.png', Buffer.from([])]);
+        const pipeline: any = { clone: jest.fn(() => pipeline) };
+        imageMock.resolveSourceImage.mockImplementation(async () => ({ src: 'test.png', image: { src: 'test.png', pipeline, metadata: {} } }));
 
-        const result = await platform.run(Platform.ANDROID, [ResourceType.ICON], {
+        const result = await platform.run(Platform.ANDROID, 'resources', {
           [ResourceType.ICON]: { sources: ['icon.png'] },
-          [ResourceType.SPLASH]: { sources: ['splash.png'] },
         });
 
-        const generatedImages = RESOURCES[Platform.ANDROID][ResourceType.ICON].images;
+        const generatedImages = getResourcesConfig(Platform.ANDROID, ResourceType.ICON).resources;
 
         expect(imageMock.resolveSourceImage).toHaveBeenCalledTimes(1);
-        expect(imageMock.resolveSourceImage).toHaveBeenCalledWith(['icon.png']);
-        expect(fsMock.ensureDir).toHaveBeenCalledTimes(1);
+        expect(imageMock.resolveSourceImage).toHaveBeenCalledWith('android', 'icon', ['icon.png'], undefined);
         expect(imageMock.generateImage).toHaveBeenCalledTimes(generatedImages.length);
 
         for (const generatedImage of generatedImages) {
-          expect(imageMock.generateImage).toHaveBeenCalledWith(generatedImage, expect.any(Buffer), expect.any(String));
+          expect(imageMock.generateImage).toHaveBeenCalledWith(
+            {
+              src: path.join('resources', generatedImage.src),
+              format: generatedImage.format,
+              width: generatedImage.width,
+              height: generatedImage.height,
+            },
+            expect.anything(),
+            expect.anything(),
+            undefined
+          );
         }
 
-        expect(result.length).toEqual(generatedImages.length);
+        expect(result.resources.length).toEqual(generatedImages.length);
+      });
 
-        for (const image of result) {
-          expect(image).toEqual(expect.objectContaining({ src: 'test.png' }));
+      it('should run through windows icons with successful result', async () => {
+        const pipeline: any = { clone: jest.fn(() => pipeline) };
+        imageMock.resolveSourceImage.mockImplementation(async () => ({ src: 'test.png', image: { src: 'test.png', pipeline, metadata: {} } }));
+
+        const result = await platform.run(Platform.WINDOWS, 'resources', {
+          [ResourceType.ICON]: { sources: ['icon.png'] },
+        });
+
+        const generatedImages = getResourcesConfig(Platform.WINDOWS, ResourceType.ICON).resources;
+
+        expect(imageMock.resolveSourceImage).toHaveBeenCalledTimes(1);
+        expect(imageMock.resolveSourceImage).toHaveBeenCalledWith('windows', 'icon', ['icon.png'], undefined);
+        expect(imageMock.generateImage).toHaveBeenCalledTimes(generatedImages.length);
+
+        for (const generatedImage of generatedImages) {
+          expect(imageMock.generateImage).toHaveBeenCalledWith(
+              {
+                src: path.join('resources', generatedImage.src),
+                format: generatedImage.format,
+                width: generatedImage.width,
+                height: generatedImage.height,
+              },
+              expect.anything(),
+              expect.anything(),
+              undefined
+          );
         }
+
+        expect(result.resources.length).toEqual(generatedImages.length);
       });
 
     });
