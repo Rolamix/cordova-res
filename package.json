@@ -1,5 +1,5 @@
 {
-  "name": "cordova-res",
+  "name": "cordova-res-multi-image",
   "version": "0.10.0",
   "description": "This tool will crop and resize PNG source images into appropriate sizes for modern iOS and Android devices.",
   "homepage": "https://ionicframework.com",
